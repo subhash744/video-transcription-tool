@@ -1,13 +1,14 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AudioLines, Check, Clipboard, FileVideo2, LoaderCircle, LockKeyhole, RotateCcw, Upload, WandSparkles } from 'lucide-react'
 import CaptionedVideoPreview from '@/components/captioned-video-preview'
-import type { CaptionResult, CaptionUnit } from '@/lib/captions'
-import { analyzeVideoFrames } from '@/lib/video-analysis'
+import PipelineLiveStatus from '@/components/pipeline-live-status'
+import type { CaptionResult, CaptionUnit, PipelineEvent, PipelineStage } from '@/lib/captions'
+import { analyzeVideoFrames, type VisualFrame } from '@/lib/video-analysis'
 
-type TranscriptResponse = { text?: string; units?: CaptionUnit[]; error?: string }
-type EditResponse = CaptionResult & { error?: string }
+type TranscriptResponse = { text?: string; units?: CaptionUnit[]; error?: string; diagnostics?: { model: string; responseFormat: string; requestedTimingGranularities: string[]; audioBytes: number; unitCount: number; timingPrecision: 'word' | 'phrase'; durationMs: number } }
+type EditResponse = CaptionResult & { error?: string; validationIssues?: Array<{ path: string; message: string }> }
 
 const MAX_DURATION = 120
 const MAX_FILE_SIZE = 100 * 1024 * 1024
@@ -39,6 +40,16 @@ export default function Home() {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [debugEvents, setDebugEvents] = useState<PipelineEvent[]>([])
+  const [visualFrames, setVisualFrames] = useState<VisualFrame[]>([])
+  const [transcriptionDiagnostics, setTranscriptionDiagnostics] = useState<TranscriptResponse['diagnostics']>()
+  const eventCounter = useRef(0)
+  const activeDebugStage = useRef<PipelineStage>('video-input')
+  const recordDebugEvent = useCallback((stage: PipelineStage, status: PipelineEvent['status'], message: string, videoTime?: number, details?: PipelineEvent['details']) => {
+    eventCounter.current += 1
+    const event: PipelineEvent = { id: `pipeline-${Date.now()}-${eventCounter.current}`, at: new Date().toISOString(), stage, status, message, ...(videoTime === undefined ? {} : { videoTime }), ...(details ? { details } : {}) }
+    setDebugEvents((current) => [...current, event])
+  }, [])
 
   useEffect(() => {
     if (!file) {
@@ -53,6 +64,10 @@ export default function Home() {
   function chooseFile(next: File | undefined) {
     if (!next) return
     setError('')
+    setDebugEvents([])
+    setVisualFrames([])
+    setTranscriptionDiagnostics(undefined)
+    eventCounter.current = 0
     setTranscript('')
     setUnits([])
     setCaptionResult(null)
@@ -81,6 +96,7 @@ export default function Home() {
       }
       setFile(next)
       setDuration(probe.duration)
+      recordDebugEvent('video-input', 'completed', 'Video metadata accepted for processing.', undefined, { fileName: next.name, mimeType: next.type, fileBytes: next.size, durationSeconds: Number(probe.duration.toFixed(3)), width: probe.videoWidth, height: probe.videoHeight })
     }
     probe.onerror = () => {
       URL.revokeObjectURL(url)
@@ -103,10 +119,13 @@ export default function Home() {
     let audioContext: AudioContext | undefined
     let recorder: MediaRecorder | undefined
     let stopTimer: ReturnType<typeof setTimeout> | undefined
+    let failureRecorded = false
 
     try {
       if (!nextTranscript || !nextUnits.length) {
         setStage('transcribing')
+        activeDebugStage.current = 'audio-extraction'
+        recordDebugEvent('audio-extraction', 'started', 'Capturing the source video’s audio track for transcription.')
         video = document.createElement('video')
         audioUrl = URL.createObjectURL(file)
         if (!('captureStream' in video)) throw new Error('Audio capture isn’t supported in this browser. Try the latest Chrome or Edge.')
@@ -148,9 +167,12 @@ export default function Home() {
         if (recorder.state === 'recording') recorder.stop()
         const audio = await recording
         if (!audio.size) throw new Error('No audio could be captured from this video.')
+        recordDebugEvent('audio-extraction', 'completed', 'Audio track captured from the source video.', undefined, { audioBytes: audio.size, mimeType: audio.type })
 
         const form = new FormData()
         form.append('audio', audio, 'video-audio.webm')
+        activeDebugStage.current = 'transcription'
+        recordDebugEvent('transcription', 'started', 'Submitted extracted audio to the transcription endpoint.')
         const response = await fetch('/api/transcribe', { method: 'POST', body: form })
         const result = await response.json() as TranscriptResponse
         if (!response.ok) throw new Error(result.error || 'Transcription failed. Please try again.')
@@ -159,22 +181,51 @@ export default function Home() {
         nextUnits = result.units ?? []
         setTranscript(nextTranscript)
         setUnits(nextUnits)
+        setTranscriptionDiagnostics(result.diagnostics)
+        recordDebugEvent('transcription', 'completed', 'Transcription and verified timing units received.', undefined, {
+          model: result.diagnostics?.model ?? 'whisper-1',
+          durationMs: result.diagnostics?.durationMs ?? null,
+          unitCount: nextUnits.length,
+          timingPrecision: result.diagnostics?.timingPrecision ?? 'unknown',
+          transcriptCharacters: nextTranscript.length,
+        })
       }
 
       if (!nextUnits.length) throw new Error('OpenAI did not return verified speech timings. Please try again.')
       setStage('analyzing')
-      const visualFrames = await analyzeVideoFrames(file)
+      activeDebugStage.current = 'frame-extraction'
+      recordDebugEvent('frame-extraction', 'started', 'Extracting sampled frames for video analysis.')
+      const analysis = await analyzeVideoFrames(file, (progress) => {
+        const stage: PipelineStage = progress.stage
+        activeDebugStage.current = stage
+        recordDebugEvent(stage, progress.status, progress.message, progress.videoTime, { frameIndex: progress.frameIndex ?? null, frameCount: progress.frameCount ?? null })
+      })
+      const visualFrames = analysis.frames
+      setVisualFrames(visualFrames)
+      if (analysis.detectionError) recordDebugEvent('subject-detection', 'fallback', analysis.detectionError)
+      activeDebugStage.current = 'model-analysis'
       setStage('designing')
+      recordDebugEvent('model-analysis', 'started', 'Sending transcript, timing units, and sampled visual analysis to GPT.')
       const response = await fetch('/api/captions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ transcript: nextTranscript, units: nextUnits, duration, visualFrames, style }),
       })
       const result = await response.json() as EditResponse
-      if (!response.ok) throw new Error(result.error || 'AI caption generation failed. Please try again.')
+      if (!response.ok) {
+        const failedStage: PipelineStage = result.validationIssues ? 'scene-graph-validation' : 'model-analysis'
+        const validationSummary = result.validationIssues?.map((issue) => `${issue.path || 'request'}: ${issue.message}`).join('; ')
+        recordDebugEvent(failedStage, 'failed', [result.error || 'AI caption generation failed. Please try again.', validationSummary].filter(Boolean).join(' · '), undefined, result.validationIssues ? { issues: result.validationIssues } : undefined)
+        failureRecorded = true
+        throw new Error(result.error || 'AI caption generation failed. Please try again.')
+      }
       setCaptionResult(result)
+      recordDebugEvent('model-analysis', 'completed', 'GPT returned structured visual observations, transcript understanding, moments, and creative decisions.', undefined, { model: result.debug.model.name, durationMs: result.debug.model.durationMs, layerCount: result.debug.model.originalOutput.layers.length, zoomCount: result.debug.model.originalOutput.zooms.length })
+      setDebugEvents((current) => [...current, ...result.debug.normalizations])
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Something went wrong. Please try again.')
+      const message = cause instanceof Error ? cause.message : 'Something went wrong. Please try again.'
+      if (!failureRecorded) recordDebugEvent(activeDebugStage.current, 'failed', message)
+      setError(message)
     } finally {
       if (stopTimer) clearTimeout(stopTimer)
       if (recorder?.state === 'recording') recorder.stop()
@@ -238,8 +289,9 @@ export default function Home() {
           <button className="transcribe-button" onClick={generateAICaptions} disabled={!file || !style || busy || Boolean(editResult)}>{busy ? <><LoaderCircle className="spinner" size={18} /> {stage === 'transcribing' ? 'Transcribing your video…' : stage === 'analyzing' ? 'Reading the video composition…' : 'Directing the Creative Runtime…'}</> : editResult ? <><Check size={18} /> Edit ready</> : <><WandSparkles size={18} /> Generate AI Edit <span>→</span></>}</button>
           <p className="time-note">The transcript provides exact words and timing. GPT directs; the motion engine renders.</p>
           {error && <p className="error-message" role="alert">{error}</p>}
+          {debugEvents.length > 0 && <PipelineLiveStatus events={debugEvents} />}
         </section>
-        {editResult && videoUrl && <section className="caption-result" aria-labelledby="caption-result-title"><div className="caption-result-heading"><div className="result-label"><Check size={14} /> STYLE - 01 · MONUMENT · SCENE GRAPH</div><h2 id="caption-result-title">Your video, in motion</h2><p>GPT directs the composition. VocalAgents Motion Engine renders every layer, frame by frame.</p></div><CaptionedVideoPreview src={videoUrl} edit={editResult} /></section>}
+        {editResult && videoUrl && <section className="caption-result" aria-labelledby="caption-result-title"><div className="caption-result-heading"><div className="result-label"><Check size={14} /> STYLE - 01 · MONUMENT · SCENE GRAPH</div><h2 id="caption-result-title">Your video, in motion</h2><p>GPT directs the composition. VocalAgents Motion Engine renders every layer, frame by frame.</p></div><CaptionedVideoPreview src={videoUrl} edit={editResult} pipelineEvents={debugEvents} visualFrames={visualFrames} transcript={transcript} units={units} videoMetadata={{ mimeType: file?.type ?? 'video/unknown', fileBytes: file?.size ?? 0, durationSeconds: duration ?? 0, transcription: transcriptionDiagnostics }} /></section>}
         {transcript && <section className="result-card" aria-labelledby="transcript-title"><div className="result-heading"><div><div className="result-label"><Check size={14} /> TRANSCRIPTION COMPLETE</div><h2 id="transcript-title">Your transcript</h2></div><button className="copy-button" onClick={copyTranscript}>{copied ? <Check size={16} /> : <Clipboard size={16} />}{copied ? 'Copied' : 'Copy text'}</button></div><p className="transcript-text">{transcript}</p><button className="start-over" onClick={reset}><RotateCcw size={14} /> Transcribe another video</button></section>}
         <footer className="page-footer"><span><LockKeyhole size={13} /> Your video isn’t saved by this app.</span><span>Transcription and edit direction by OpenAI</span></footer>
       </section>

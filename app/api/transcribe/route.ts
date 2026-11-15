@@ -29,6 +29,7 @@ export async function POST(request: Request) {
     openAiForm.append('timestamp_granularities[]', 'word')
     openAiForm.append('timestamp_granularities[]', 'segment')
 
+    const transcriptionStartedAt = Date.now()
     const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey}` },
@@ -59,7 +60,19 @@ export async function POST(request: Request) {
         : []
     })
     const units = wordUnits.length ? wordUnits : phraseUnits
-    return NextResponse.json({ text: typeof result.text === 'string' ? result.text : '', units })
+    return NextResponse.json({
+      text: typeof result.text === 'string' ? result.text : '',
+      units,
+      diagnostics: {
+        model: 'whisper-1',
+        responseFormat: 'verbose_json',
+        requestedTimingGranularities: ['word', 'segment'],
+        audioBytes: audio.size,
+        unitCount: units.length,
+        timingPrecision: wordUnits.length ? 'word' : 'phrase',
+        durationMs: Date.now() - transcriptionStartedAt,
+      },
+    })
   } catch (error) {
     const message = error instanceof Error && error.name === 'TimeoutError'
       ? 'Transcription took too long. Please try again.'

@@ -44,9 +44,18 @@ export const ZoomPlanSchema = z.object({
   scale: z.number().min(1.04).max(1.1),
 })
 
+const CaptionPlanAnalysisSchema = z.object({
+  visualObservations: z.array(z.object({ frameTime: z.number().min(0), observation: z.string().trim().min(1).max(500) })).max(60),
+  interpretations: z.array(z.object({ frameTime: z.number().min(0).nullable(), interpretation: z.string().trim().min(1).max(500), uncertainty: z.string().trim().min(1).max(300) })).max(60),
+  transcriptUnderstanding: z.string().trim().min(1).max(2_000),
+  importantMoments: z.array(z.object({ unitIndexes: z.array(z.number().int().nonnegative()).min(1).max(8), rationale: z.string().trim().min(1).max(500) })).max(30),
+  creativeRationales: z.array(z.object({ unitIndexes: z.array(z.number().int().nonnegative()).min(1).max(12), decision: z.enum(['caption', 'headline', 'motion', 'zoom', 'depth']), selectedValue: z.string().trim().min(1).max(100), rationale: z.string().trim().min(1).max(500) })).max(180),
+})
+
 export const CaptionPlanSchema = z.object({
   layers: z.array(CreativeLayerSchema).max(180),
   zooms: z.array(ZoomPlanSchema).max(8),
+  analysis: CaptionPlanAnalysisSchema,
 })
 
 export const VisualFrameSchema = z.object({
@@ -98,10 +107,28 @@ export type MotionTextLayer = {
   motion: TextMotion
 }
 export type ZoomCue = { start: number; end: number; scale: number }
+export type CaptionPlan = z.infer<typeof CaptionPlanSchema>
+export type PipelineStage = 'video-input' | 'audio-extraction' | 'transcription' | 'frame-extraction' | 'subject-detection' | 'model-analysis' | 'scene-graph-validation' | 'preview-render' | 'video-export'
+export type DebugValue = string | number | boolean | null | DebugValue[] | { [key: string]: DebugValue }
+export type PipelineEvent = {
+  id: string
+  at: string
+  stage: PipelineStage
+  status: 'started' | 'progress' | 'completed' | 'modified' | 'failed' | 'fallback' | 'warning'
+  message: string
+  videoTime?: number
+  details?: Record<string, DebugValue>
+}
+export type CaptionDebugData = {
+  model: { name: string; durationMs: number; originalOutput: CaptionPlan }
+  finalSceneGraph: { layers: MotionTextLayer[]; zooms: ZoomCue[] }
+  normalizations: PipelineEvent[]
+}
 export type CaptionResult = {
   layers: MotionTextLayer[]
   zooms: ZoomCue[]
   timingPrecision: 'word' | 'phrase'
   segmentationAvailable: boolean
   style: 'monument'
+  debug: CaptionDebugData
 }

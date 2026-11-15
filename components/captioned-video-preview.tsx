@@ -4,10 +4,20 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Download, Pause, Play } from 'lucide-react'
 import { FaceLandmarker, FilesetResolver, ImageSegmenter } from '@mediapipe/tasks-vision'
 import { fetchFile, toBlobURL } from '@ffmpeg/util'
-import type { CaptionResult, MotionTextLayer, MotionWord } from '@/lib/captions'
+import type { CaptionResult, CaptionUnit, MotionTextLayer, MotionWord, PipelineEvent, PipelineStage } from '@/lib/captions'
+import type { VisualFrame } from '@/lib/video-analysis'
 import CreativeRuntimeInspector from '@/components/creative-runtime-inspector'
+import DebugInspector from '@/components/debug-inspector'
 
-type CaptionedVideoPreviewProps = { src: string; edit: CaptionResult }
+type CaptionedVideoPreviewProps = {
+  src: string
+  edit: CaptionResult
+  pipelineEvents: PipelineEvent[]
+  visualFrames: VisualFrame[]
+  transcript: string
+  units: CaptionUnit[]
+  videoMetadata: { mimeType: string; fileBytes: number; durationSeconds: number; transcription?: { model: string; responseFormat: string; requestedTimingGranularities: string[]; audioBytes: number; unitCount: number; timingPrecision: 'word' | 'phrase'; durationMs: number } }
+}
 
 const MAX_PREVIEW_WIDTH = 1280
 const fontStacks = {
@@ -19,8 +29,10 @@ const fontStacks = {
   rounded: 'Trebuchet MS, Arial, sans-serif',
 } satisfies Record<MotionWord['fontFamily'], string>
 
-function drawMotionLayer(context: CanvasRenderingContext2D, layer: MotionTextLayer, time: number, width: number, height: number) {
-  if (time < layer.start || time >= layer.end) return
+type LayerBounds = { left: number; top: number; right: number; bottom: number }
+
+function drawMotionLayer(context: CanvasRenderingContext2D, layer: MotionTextLayer, time: number, width: number, height: number): LayerBounds | null {
+  if (time < layer.start || time >= layer.end) return null
   const elapsed = Math.max(0, Math.min(1, (time - layer.start) / 0.16))
   const activeWord = layer.kind === 'caption' ? layer.words.find((word) => time >= word.start && time < word.end) : undefined
   const entryDuration = layer.motion === 'impact' ? 0.22 : layer.motion === 'monument-rise' ? 0.28 : layer.motion === 'hero-expansion' ? 0.35 : 0.16
@@ -63,6 +75,8 @@ function drawMotionLayer(context: CanvasRenderingContext2D, layer: MotionTextLay
   const anchorY = layer.y * height + animationY
   const boxLeft = anchorX - maxWidth / 2
   let cursorY = anchorY - totalHeight / 2
+  const lineLefts = lines.map((item) => layer.align === 'left' ? boxLeft : layer.align === 'right' ? boxLeft + maxWidth - item.width : anchorX - item.width / 2)
+  const bounds = { left: Math.min(...lineLefts), top: cursorY, right: Math.max(...lineLefts.map((left, index) => left + lines[index].width)), bottom: cursorY + totalHeight }
 
   context.save()
   context.globalAlpha = animationAlpha
@@ -111,6 +125,7 @@ function drawMotionLayer(context: CanvasRenderingContext2D, layer: MotionTextLay
     cursorY += item.height
   }
   context.restore()
+  return bounds
 }
 
 type FFmpegInstance = {
@@ -140,7 +155,12 @@ function activeCue<T extends { start: number; end: number }>(cues: T[], time: nu
   return cues.find((cue) => time >= cue.start && time < cue.end)
 }
 
-export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPreviewProps) {
+function layerRenderFingerprint(layer: MotionTextLayer) {
+  const words = layer.words.map((word) => [word.text, word.fontFamily, word.fontScale, word.fontWeight, word.color, word.italic, word.uppercase].join('/')).join('|')
+  return [layer.id, layer.kind, layer.start, layer.end, layer.x, layer.y, layer.width, layer.depth, layer.motion, layer.fontFamily, layer.fontScale, layer.fontWeight, layer.color, layer.background, words].join(':')
+}
+
+export default function CaptionedVideoPreview({ src, edit, pipelineEvents, visualFrames, transcript, units, videoMetadata }: CaptionedVideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [ready, setReady] = useState(false)
@@ -164,6 +184,17 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
   const faceBoxRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null)
   const lastSegmentAt = useRef(0)
   const lastSegmentVideoTime = useRef(-1)
+  const [rendererEvents, setRendererEvents] = useState<PipelineEvent[]>([])
+  const rendererEventSequence = useRef(0)
+  const exportRunSequence = useRef(0)
+  const loggedRenderEvents = useRef(new Set<string>())
+  const recordRendererEvent = useCallback((key: string, stage: PipelineStage, status: PipelineEvent['status'], message: string, videoTime?: number, details?: PipelineEvent['details']) => {
+    if (loggedRenderEvents.current.has(key)) return
+    loggedRenderEvents.current.add(key)
+    rendererEventSequence.current += 1
+    const event: PipelineEvent = { id: `render-${Date.now()}-${rendererEventSequence.current}`, at: new Date().toISOString(), stage, status, message, ...(videoTime === undefined ? {} : { videoTime }), ...(details ? { details } : {}) }
+    setRendererEvents((current) => [...current, event])
+  }, [])
 
   const togglePlayback = useCallback(() => {
     const video = videoRef.current
@@ -203,8 +234,10 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
         segmenter = nextSegmenter
         faceLandmarker = nextFace
         setVisualStatus('ready')
-      } catch {
+        recordRendererEvent('preview-vision-ready', 'preview-render', 'completed', 'Preview face and segmentation models initialized.')
+      } catch (error) {
         setVisualStatus('fallback')
+        recordRendererEvent('preview-vision-fallback', 'preview-render', 'fallback', error instanceof Error ? `Preview tracking unavailable: ${error.message}` : 'Preview tracking unavailable; foreground text rendering remains active.')
       }
     }
     void loadVision()
@@ -219,6 +252,7 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
       if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height }
       const time = video.currentTime
       const zoom = activeCue(activeEdit.zooms, time)
+      if (zoom) recordRendererEvent(`render-zoom-${zoom.start}-${zoom.scale}`, 'preview-render', 'completed', `Camera zoom ${zoom.scale.toFixed(2)}× executed.`, time, { start: zoom.start, end: zoom.end, scale: zoom.scale })
       const face = faceBoxRef.current
       const pivotX = face ? (face.x + face.width / 2) * width : width / 2
       const pivotY = face ? (face.y + face.height / 2) * height : height / 2
@@ -254,7 +288,7 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
               width: previousFace.width + (nextFace.width - previousFace.width) * 0.38,
               height: previousFace.height + (nextFace.height - previousFace.height) * 0.38,
             } : nextFace
-          }
+          } else faceBoxRef.current = null
           segmenter.segmentForVideo(segmentationFrame, timestamp, (result) => {
             const mask = result.confidenceMasks?.[0]
             if (!mask) { foregroundRef.current = null; segmentBusy = false; return }
@@ -287,17 +321,31 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
             mask.close()
             segmentBusy = false
           })
-        } catch {
+        } catch (error) {
           segmentBusy = false
           foregroundRef.current = null
+          recordRendererEvent(`preview-segment-error-${Math.floor(time / 2)}`, 'preview-render', 'failed', error instanceof Error ? `Preview segmentation failed: ${error.message}` : 'Preview segmentation failed.', time)
         }
       }
 
       const maskAvailable = Boolean(foregroundRef.current)
+      const requestedBehindLayers = activeEdit.layers.filter((layer) => layer.depth === 'behind-subject' && time >= layer.start && time < layer.end)
       const behindLayers = activeEdit.layers.filter((layer) => layer.depth === 'behind-subject' && layer.kind === 'headline' && maskAvailable)
       const foregroundLayers = activeEdit.layers.filter((layer) => !behindLayers.includes(layer))
+      requestedBehindLayers.filter((layer) => !behindLayers.includes(layer)).forEach((layer) => {
+        const unsupportedLayerType = layer.kind !== 'headline'
+        const message = unsupportedLayerType ? `${layer.id} requested text-behind-subject, but the renderer supports that effect only for headlines; rendered in foreground.` : `${layer.id} requested text-behind-subject, but no usable segmentation mask was available at this frame; rendered in foreground.`
+        recordRendererEvent(`depth-fallback-${layerRenderFingerprint(layer)}`, 'preview-render', 'fallback', message, time, { layerId: layer.id, requestedDepth: 'behind-subject', renderedDepth: 'foreground', subjectMaskAvailable: maskAvailable, unsupportedLayerType })
+      })
 
-      behindLayers.forEach((layer) => drawMotionLayer(context, layer, time, width, height))
+      behindLayers.forEach((layer) => {
+        const bounds = drawMotionLayer(context, layer, time, width, height)
+        if (!bounds) return
+        const overlapsFace = Boolean(face && bounds.left < (face.x + face.width) * width && bounds.right > face.x * width && bounds.top < (face.y + face.height) * height && bounds.bottom > face.y * height)
+        const outsideSafeArea = bounds.left < width * 0.04 || bounds.right > width * 0.96 || bounds.top < height * 0.05 || bounds.bottom > height * 0.9
+        const status = outsideSafeArea || overlapsFace ? 'warning' : 'completed'
+        recordRendererEvent(`render-layer-${layerRenderFingerprint(layer)}`, 'preview-render', status, `${layer.id} rendered behind the detected subject.`, time, { layerId: layer.id, effect: 'text-behind-subject', bounds: { left: Number((bounds.left / width).toFixed(4)), top: Number((bounds.top / height).toFixed(4)), right: Number((bounds.right / width).toFixed(4)), bottom: Number((bounds.bottom / height).toFixed(4)) }, outsideSafeArea, overlapsFace })
+      })
 
       if (behindLayers.length && foregroundRef.current) {
         context.save()
@@ -308,7 +356,20 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
         context.restore()
       }
 
-      foregroundLayers.forEach((layer) => drawMotionLayer(context, layer, time, width, height))
+      foregroundLayers.forEach((layer) => {
+        const bounds = drawMotionLayer(context, layer, time, width, height)
+        if (!bounds) return
+        if (layer.depth === 'behind-subject') {
+          recordRendererEvent(`render-layer-fallback-${layerRenderFingerprint(layer)}`, 'preview-render', 'fallback', `${layer.id} was composited in front because behind-subject execution was unavailable.`, time, { layerId: layer.id, renderedDepth: 'foreground', requestedDepth: 'behind-subject' })
+          return
+        }
+        const overlapsFace = Boolean(face && bounds.left < (face.x + face.width) * width && bounds.right > face.x * width && bounds.top < (face.y + face.height) * height && bounds.bottom > face.y * height)
+        const outsideSafeArea = bounds.left < width * 0.04 || bounds.right > width * 0.96 || bounds.top < height * 0.05 || bounds.bottom > height * 0.9
+        const unsupportedMotion = layer.motion === 'hard-cut'
+        const status: PipelineEvent['status'] = outsideSafeArea || overlapsFace ? 'warning' : unsupportedMotion ? 'modified' : 'completed'
+        const message = outsideSafeArea ? `${layer.id} rendered beyond the configured 4% horizontal / 5% top / 10% bottom safe area.` : overlapsFace ? `${layer.id} rendered over the tracked face boundary.` : unsupportedMotion ? `${layer.id} requested hard-cut; the renderer used its default immediate text draw and exit alpha.` : `${layer.id} rendered with ${layer.motion} motion.`
+        recordRendererEvent(`render-layer-${layerRenderFingerprint(layer)}`, 'preview-render', status, message, time, { layerId: layer.id, effect: layer.motion, font: layer.fontFamily, position: { x: layer.x, y: layer.y, width: layer.width }, bounds: { left: Number((bounds.left / width).toFixed(4)), top: Number((bounds.top / height).toFixed(4)), right: Number((bounds.right / width).toFixed(4)), bottom: Number((bounds.bottom / height).toFixed(4)) }, outsideSafeArea, overlapsFace, unsupportedMotion })
+      })
 
       context.save()
       context.font = `500 ${Math.max(10, height * 0.014)}px Inter, Arial, sans-serif`
@@ -326,7 +387,10 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
       }
     }
 
-    const onMetadata = () => setReady(true)
+    const onMetadata = () => {
+      setReady(true)
+      recordRendererEvent('preview-ready', 'preview-render', 'completed', 'Preview video metadata loaded; canvas renderer can render the source.', undefined, { width: video.videoWidth, height: video.videoHeight, durationSeconds: Number(video.duration.toFixed(3)) })
+    }
     const onPlay = () => setPlaying(true)
     const onPause = () => setPlaying(false)
     video.addEventListener('loadedmetadata', onMetadata)
@@ -356,6 +420,8 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
       return
     }
     setExporting(true)
+    const exportRun = ++exportRunSequence.current
+    recordRendererEvent(`export-${exportRun}-started`, 'video-export', 'started', 'Export started using the live rendered canvas and source audio.', undefined, { exportRun, durationSeconds: Number(video.duration.toFixed(3)), canvasWidth: canvas.width, canvasHeight: canvas.height })
     setExportMessage('Rendering your edited video…')
     const previousTime = video.currentTime
     const wasPlaying = !video.paused
@@ -379,11 +445,14 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
         recorder.addEventListener('error', () => reject(new Error('The video render failed. Please try again.')), { once: true })
       })
       recorder.start(250)
+      recordRendererEvent(`export-${exportRun}-capture-started`, 'video-export', 'progress', 'Canvas capture and source-audio recording started.', undefined, { mimeType, frameRate: 30 })
       await video.play()
       await new Promise<void>((resolve) => video.addEventListener('ended', () => resolve(), { once: true }))
       recorder.stop()
       const webm = await finished
+      recordRendererEvent(`export-${exportRun}-capture-completed`, 'video-export', 'completed', 'Canvas video and source audio were captured into a WebM intermediate.', undefined, { webmBytes: webm.size, mimeType })
       setExportMessage('Converting your edit to MP4…')
+      recordRendererEvent(`export-${exportRun}-conversion-started`, 'video-export', 'progress', 'Loading the MP4 encoder and starting conversion.')
       const FFmpeg = await loadFFmpegLibrary()
       ffmpeg = new FFmpeg()
       const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd'
@@ -398,6 +467,7 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
       if (conversion !== 0) throw new Error('MP4 conversion failed. Please try exporting again in Chrome or Edge.')
       const mp4Data = await ffmpeg.readFile('edit.mp4')
       const mp4 = new Blob([mp4Data as Uint8Array<ArrayBuffer>], { type: 'video/mp4' })
+      recordRendererEvent(`export-${exportRun}-conversion-completed`, 'video-export', 'completed', 'FFmpeg converted the WebM render to MP4.', undefined, { mp4Bytes: mp4.size, mimeType: mp4.type })
       await ffmpeg.deleteFile('edit.webm')
       await ffmpeg.deleteFile('edit.mp4')
       const link = document.createElement('a')
@@ -405,9 +475,12 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
       link.download = 'vocal-ai-edit.mp4'
       link.click()
       setTimeout(() => URL.revokeObjectURL(link.href), 60_000)
+      recordRendererEvent(`export-${exportRun}-downloaded`, 'video-export', 'completed', 'MP4 download was handed to the browser.', undefined, { mp4Bytes: mp4.size })
       setExportMessage('MP4 export downloaded.')
     } catch (error) {
-      setExportMessage(error instanceof Error ? error.message : 'Could not export this video.')
+      const message = error instanceof Error ? error.message : 'Could not export this video.'
+      recordRendererEvent(`export-${exportRun}-failed`, 'video-export', 'failed', message)
+      setExportMessage(message)
     } finally {
       ffmpeg?.terminate()
       video.pause()
@@ -447,6 +520,7 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
         <button type="button" className="export-button" onClick={exportVideo} disabled={!ready || exporting}><Download size={15} />{exporting ? 'Rendering…' : 'Download video'}</button>
       </div>
       <CreativeRuntimeInspector edit={workingEdit} currentTime={currentTime} selectedLayerId={selectedLayerId} onSelectLayer={setSelectedLayerId} onUpdateLayer={updateLayer} onUpdateZoom={updateZoom} onSeek={(time) => { if (videoRef.current) videoRef.current.currentTime = time }} />
+      <DebugInspector edit={workingEdit} pipelineEvents={pipelineEvents} rendererEvents={rendererEvents} visualFrames={visualFrames} transcript={transcript} units={units} videoMetadata={videoMetadata} onSeek={(time) => { if (videoRef.current) videoRef.current.currentTime = time }} />
       {activeSpokenWord && <p className="sr-only" aria-live="polite">Caption: {activeSpokenWord.text}</p>}
       {activeLayer?.kind === 'headline' && <p className="sr-only" aria-live="polite">Headline: {activeLayer.words.map((word) => word.text).join(' ')}</p>}
       <p className="caption-preview-note">The Creative Runtime composes editable text layers from your transcript, then renders the same scene graph for preview and export.</p>
