@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Download, Pause, Play } from 'lucide-react'
+import { Download, Maximize2, Minimize2, Pause, Play } from 'lucide-react'
 import { FaceLandmarker, FilesetResolver, ImageSegmenter } from '@mediapipe/tasks-vision'
 import { fetchFile, toBlobURL } from '@ffmpeg/util'
 import type { CaptionResult, MotionTextLayer, MotionWord } from '@/lib/captions'
@@ -27,30 +27,43 @@ function drawMotionLayer(context: CanvasRenderingContext2D, layer: MotionTextLay
   const entryProgress = Math.max(0, Math.min(1, (time - layer.start) / entryDuration))
   const easedEntryProgress = 1 - (1 - entryProgress) ** 3
   const exitProgress = Math.max(0, Math.min(1, (layer.end - time) / (layer.motion === 'hero-expansion' ? 0.18 : 0.12)))
-  const fontSize = (word: MotionWord) => Math.max(14, Math.min(height * 0.34, height * word.fontScale))
+  let scaleFactor = 1
+  const fontSize = (word: MotionWord) => Math.max(14, Math.min(height * 0.34, height * word.fontScale * scaleFactor))
   const font = (word: MotionWord) => `${word.italic ? 'italic ' : ''}${word.fontWeight} ${fontSize(word)}px ${fontStacks[word.fontFamily]}`
   const gap = height * 0.012
-  const maxWidth = width * layer.width
-  const lines: { words: { word: MotionWord; width: number; active: boolean }[]; width: number; height: number }[] = []
-  let line: typeof lines[number] = { words: [], width: 0, height: 0 }
-
-  for (const word of layer.words) {
-    context.font = font(word)
-    const label = word.uppercase ? word.text.toLocaleUpperCase() : word.text
-    const wordWidth = context.measureText(label).width
-    const wordGap = line.words.length ? gap : 0
-    if (line.words.length && line.width + wordGap + wordWidth > maxWidth) {
-      lines.push(line)
-      line = { words: [], width: 0, height: 0 }
+  const maxWidth = width * Math.min(layer.width, 0.94)
+  type TextLine = { words: { word: MotionWord; width: number; active: boolean }[]; width: number; height: number }
+  const buildLines = () => {
+    const lines: TextLine[] = []
+    let line: TextLine = { words: [], width: 0, height: 0 }
+    for (const word of layer.words) {
+      context.font = font(word)
+      const label = word.uppercase ? word.text.toLocaleUpperCase() : word.text
+      const wordWidth = context.measureText(label).width
+      if (line.words.length && line.width + gap + wordWidth > maxWidth) {
+        lines.push(line)
+        line = { words: [], width: 0, height: 0 }
+      }
+      const nextGap = line.words.length ? gap : 0
+      line.words.push({ word: { ...word, text: label }, width: wordWidth, active: word === activeWord })
+      line.width += nextGap + wordWidth
+      line.height = Math.max(line.height, fontSize(word) * 1.16)
     }
-    const nextGap = line.words.length ? gap : 0
-    line.words.push({ word: { ...word, text: label }, width: wordWidth, active: word === activeWord })
-    line.width += nextGap + wordWidth
-    line.height = Math.max(line.height, fontSize(word) * 1.16)
+    if (line.words.length) lines.push(line)
+    return lines
   }
-  if (line.words.length) lines.push(line)
-
-  const totalHeight = lines.reduce((sum, item) => sum + item.height, 0)
+  let lines = buildLines()
+  let totalHeight = lines.reduce((sum, item) => sum + item.height, 0)
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const widestLine = Math.max(0, ...lines.map((item) => item.width))
+    const scaleForWidth = widestLine > maxWidth ? maxWidth / widestLine : 1
+    const scaleForHeight = totalHeight > height * 0.84 ? (height * 0.84) / totalHeight : 1
+    const nextScale = scaleFactor * Math.min(scaleForWidth, scaleForHeight, 0.92)
+    if (nextScale >= scaleFactor || nextScale <= 0.12) break
+    scaleFactor = nextScale
+    lines = buildLines()
+    totalHeight = lines.reduce((sum, item) => sum + item.height, 0)
+  }
   const animationY = layer.motion === 'monument-rise'
     ? (1 - easedEntryProgress) * 36 * (height / 1080)
     : layer.motion === 'rise' ? (1 - elapsed) * height * 0.035 : 0
@@ -59,8 +72,12 @@ function drawMotionLayer(context: CanvasRenderingContext2D, layer: MotionTextLay
   const impactScale = impactProgress < 0.65 ? 0.85 + 0.18 * (impactProgress / 0.65) : 1.03 - 0.03 * ((impactProgress - 0.65) / 0.35)
   const animationScale = layer.motion === 'impact' ? impactScale : layer.motion === 'hero-expansion' ? 0.9 + easedEntryProgress * 0.1 : layer.motion === 'pop' ? 0.92 + elapsed * 0.08 : 1
   const animationAlpha = layer.motion === 'monument-rise' || layer.motion === 'hero-expansion' ? easedEntryProgress * exitProgress : layer.motion === 'impact' ? Math.min(1, entryProgress * 5) * exitProgress : layer.motion === 'fade' ? elapsed * exitProgress : exitProgress
-  const anchorX = layer.x * width + animationX
-  const anchorY = layer.y * height + animationY
+  const safeMargin = height * 0.025
+  const anchorX = Math.max(maxWidth / 2 + safeMargin, Math.min(width - maxWidth / 2 - safeMargin, layer.x * width + animationX))
+  const desiredAnchorY = layer.y * height + animationY
+  const minAnchorY = totalHeight / 2 + safeMargin
+  const maxAnchorY = height - totalHeight / 2 - safeMargin
+  const anchorY = Math.max(minAnchorY, Math.min(maxAnchorY, desiredAnchorY))
   const boxLeft = anchorX - maxWidth / 2
   let cursorY = anchorY - totalHeight / 2
 
@@ -145,6 +162,8 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [ready, setReady] = useState(false)
   const [playing, setPlaying] = useState(false)
+  const [isFullscreen, setIsFullscreen] = useState(false)
+  const frameRef = useRef<HTMLDivElement>(null)
   const [exporting, setExporting] = useState(false)
   const [exportMessage, setExportMessage] = useState('')
   const [currentTime, setCurrentTime] = useState(0)
@@ -165,12 +184,29 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
   const lastSegmentAt = useRef(0)
   const lastSegmentVideoTime = useRef(-1)
 
+  useEffect(() => {
+    const onFullscreenChange = () => setIsFullscreen(document.fullscreenElement === frameRef.current)
+    document.addEventListener('fullscreenchange', onFullscreenChange)
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange)
+  }, [])
+
   const togglePlayback = useCallback(() => {
     const video = videoRef.current
     if (!video) return
     if (video.paused) void video.play()
     else video.pause()
   }, [])
+
+  async function toggleFullscreen() {
+    const frame = frameRef.current
+    if (!frame) return
+    try {
+      if (document.fullscreenElement === frame) await document.exitFullscreen()
+      else await frame.requestFullscreen()
+    } catch {
+      setExportMessage('Full-screen viewing is not available in this browser.')
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -256,8 +292,20 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
             } : nextFace
           }
           segmenter.segmentForVideo(segmentationFrame, timestamp, (result) => {
-            const mask = result.confidenceMasks?.[0]
-            if (!mask) { foregroundRef.current = null; segmentBusy = false; return }
+            const masks = result.confidenceMasks
+            if (!masks?.length) { foregroundRef.current = null; segmentBusy = false; return }
+            const face = faceBoxRef.current
+            const faceX = Math.min(masks[0].width - 1, Math.max(0, Math.round(((face?.x ?? 0.5) + (face?.width ?? 0) / 2) * masks[0].width)))
+            const faceY = Math.min(masks[0].height - 1, Math.max(0, Math.round(((face?.y ?? 0.3) + (face?.height ?? 0) / 2) * masks[0].height)))
+            const facePixel = faceY * masks[0].width + faceX
+            let maskIndex = 0
+            let faceConfidence = -1
+            masks.forEach((candidate, index) => {
+              const confidence = candidate.getAsFloat32Array()[facePixel]
+              if (confidence > faceConfidence) { faceConfidence = confidence; maskIndex = index }
+            })
+            const mask = masks[maskIndex]
+            masks.forEach((candidate, index) => { if (index !== maskIndex) candidate.close() })
             const maskWidth = mask.width, maskHeight = mask.height
             const values = mask.getAsFloat32Array()
             const maskCanvas = document.createElement('canvas')
@@ -294,7 +342,7 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
       }
 
       const maskAvailable = Boolean(foregroundRef.current)
-      const behindLayers = activeEdit.layers.filter((layer) => layer.depth === 'behind-subject' && layer.kind === 'headline' && maskAvailable)
+      const behindLayers = activeEdit.layers.filter((layer) => layer.depth === 'behind-subject' && maskAvailable)
       const foregroundLayers = activeEdit.layers.filter((layer) => !behindLayers.includes(layer))
 
       if (behindLayers.length && foregroundRef.current) {
@@ -441,7 +489,7 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
 
   return (
     <section className="video-preview-card" aria-label="AI-edited video preview">
-      <div className="video-frame" style={ready ? { aspectRatio: `${videoRef.current?.videoWidth || 16} / ${videoRef.current?.videoHeight || 9}` } : undefined}>
+      <div ref={frameRef} className={`video-frame${isFullscreen ? ' is-fullscreen' : ''}`} style={ready ? { aspectRatio: `${videoRef.current?.videoWidth || 16} / ${videoRef.current?.videoHeight || 9}` } : undefined}>
         <video ref={videoRef} className="caption-preview-video" src={src} playsInline preload="metadata" aria-label="Source video for the AI edit" />
         <canvas ref={canvasRef} className="creator-render-canvas" aria-label="Rendered AI-edited video" />
         <div className="render-controls">
@@ -450,6 +498,9 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
           </button>
           <input aria-label="Video playback position" type="range" min="0" max={videoRef.current?.duration || 1} step="0.05" value={currentTime} onChange={(event) => { if (videoRef.current) videoRef.current.currentTime = Number(event.target.value) }} />
           <span>{Math.floor(currentTime / 60)}:{String(Math.floor(currentTime % 60)).padStart(2, '0')}</span>
+          <button type="button" className="render-control fullscreen-control" onClick={toggleFullscreen} aria-label={isFullscreen ? 'Exit full screen' : 'View full screen'} title={isFullscreen ? 'Exit full screen' : 'View full screen'}>
+            {isFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+          </button>
         </div>
       </div>
       <div className="preview-footer">
