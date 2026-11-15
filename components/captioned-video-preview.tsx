@@ -73,7 +73,7 @@ function drawMotionLayer(context: CanvasRenderingContext2D, layer: MotionTextLay
   if (layer.background !== 'none') {
     const paddingX = height * 0.018
     const paddingY = height * 0.009
-    context.fillStyle = layer.background === 'pill' ? 'rgba(9, 13, 17, .76)' : 'rgba(210, 255, 56, .78)'
+    context.fillStyle = layer.background === 'pill' ? 'rgba(17, 17, 17, .82)' : 'rgba(255, 90, 42, .82)'
     for (const item of lines) {
       const x = layer.align === 'left' ? boxLeft : layer.align === 'right' ? boxLeft + maxWidth - item.width : anchorX - item.width / 2
       const radius = layer.background === 'pill' ? item.height * 0.28 : item.height * 0.08
@@ -296,16 +296,6 @@ export default function CaptionedVideoPreview({ src, edit }: CaptionedVideoPrevi
       const maskAvailable = Boolean(foregroundRef.current)
       const behindLayers = activeEdit.layers.filter((layer) => layer.depth === 'behind-subject' && layer.kind === 'headline' && maskAvailable)
       const foregroundLayers = activeEdit.layers.filter((layer) => !behindLayers.includes(layer))
-
-      if (behindLayers.length && foregroundRef.current) {
-        context.save()
-        context.filter = `blur(${Math.max(5, height * 0.008)}px)`
-        context.translate(pivotX, pivotY)
-        context.scale(Math.max(1, easedScale), Math.max(1, easedScale))
-        context.translate(-pivotX, -pivotY)
-        context.drawImage(video, 0, 0, width, height)
-        context.restore()
-      }
 
       behindLayers.forEach((layer) => drawMotionLayer(context, layer, time, width, height))
 
